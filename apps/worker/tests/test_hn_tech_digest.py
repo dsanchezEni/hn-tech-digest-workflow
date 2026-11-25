@@ -1,6 +1,9 @@
 import asyncio
+import base64
 from datetime import timedelta
+from email import message_from_bytes
 
+import pytest
 from mistralai.workflows.testing import create_test_worker
 from worker.workflows import hn_tech_digest as mod
 
@@ -98,28 +101,40 @@ def test_parse_json_object_wrapped() -> None:
     assert mod._parse_json_object('Voici le JSON :\n{"a": 1}\nfin') == {"a": 1}
 
 
-def test_extract_message_id_plain_dict() -> None:
-    assert mod._extract_message_id({"id": "msg-1", "threadId": "t"}) == "msg-1"
+def test_build_raw_mime() -> None:
+    raw = mod._build_raw_mime(
+        "a@b.c",
+        "Sujet",
+        "Corps du mail",
+        base64.b64encode(b"MP3DATA").decode(),
+        "pod.mp3",
+    )
+    msg = message_from_bytes(base64.urlsafe_b64decode(raw))
+    assert msg["To"] == "a@b.c"
+    assert msg["Subject"] == "Sujet"
+    texts = [p for p in msg.walk() if p.get_content_type() == "text/plain"]
+    assert texts and "Corps du mail" in texts[0].get_payload(decode=True).decode()
+    attachments = [p for p in msg.walk() if p.get_content_maintype() == "audio"]
+    assert len(attachments) == 1
+    assert attachments[0].get_filename() == "pod.mp3"
+    assert attachments[0].get_payload(decode=True) == b"MP3DATA"
 
 
-def test_extract_message_id_mcp_content_block() -> None:
-    result = {"content": [{"type": "text", "text": '{"id": "msg-2", "threadId": "t"}'}]}
-    assert mod._extract_message_id(result) == "msg-2"
-
-
-def test_extract_message_id_unknown_shape() -> None:
-    assert mod._extract_message_id({"unexpected": True}) is None
-    assert mod._extract_message_id("not-a-dict") is None
+async def test_gmail_access_token_requires_secrets(monkeypatch) -> None:
+    for name in mod.GMAIL_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(RuntimeError, match="GMAIL_CLIENT_ID"):
+        await mod._gmail_access_token()
 
 
 async def test_hn_tech_digest_end_to_end(monkeypatch, temporal_env) -> None:
     sent: dict = {}
 
-    async def fake_gmail_send(client, *, to, subject, body, audio_b64, filename):
+    async def fake_gmail_send(to, subject, body, audio_b64, filename):
         sent.update(
             to=to, subject=subject, body=body, audio_b64=audio_b64, filename=filename
         )
-        return {"id": "msg-123", "threadId": "th-1", "labelIds": ["SENT"]}
+        return "msg-123"
 
     monkeypatch.setattr(mod, "_http_get_json", _fake_http_get_json)
     monkeypatch.setattr(mod, "_chat_complete_json", _fake_chat_complete_json)

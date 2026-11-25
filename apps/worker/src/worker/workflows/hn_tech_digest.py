@@ -1,31 +1,35 @@
-"""One-off HackerNews tech digest: fetch the front page, keep only tech-sector news,
-then email a French summary with a short podcast-style MP3 to the triggering user's
-own Gmail inbox. On-behalf-of workflow: manual runs only, never scheduled."""
+"""HackerNews tech digest, run on a daily schedule (and manually on demand).
 
+Fetches the Hacker News front page, keeps only tech-sector news, then emails a
+French summary with a short podcast-style MP3 to the configured Gmail inbox.
+
+The workflow runs as the deployment's service identity (not on-behalf-of), so it
+can be scheduled: Mistral chat/TTS calls use the worker's credentials, and the
+email is sent through the Gmail REST API using a refresh token bound from
+workspace secrets (GMAIL_CLIENT_ID / GMAIL_CLIENT_SECRET / GMAIL_REFRESH_TOKEN).
+"""
+
+import base64
 import json
+import os
 import re
 from datetime import timedelta
 
 import pydantic
 from mistralai import workflows
-from mistralai.workflows import Depends
 from mistralai.workflows.plugins.mistralai import get_mistral_client
-from mistralai.workflows.plugins.mistralai.connectors import (
-    ToolCallClient,
-    connector,
-    uses_connectors,
-)
-
-gmail = connector("gmail")
 
 HN_FRONT_PAGE_URL = "https://hn.algolia.com/api/v1/search"
 HN_HITS_PER_PAGE = 30
 CHAT_MODEL = "mistral-medium-latest"
 TTS_MODEL = "voxtral-mini-tts-3-0"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GMAIL_SEND_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages/send"
 DEFAULT_RECIPIENT = "dsanchez@campus-eni.fr"
 DEFAULT_VOICE_ID = "voice_592"
 DEFAULT_TOP_N = 10
 MAX_ATTACHMENT_B64_CHARS = 4_000_000
+GMAIL_ENV_VARS = ("GMAIL_CLIENT_ID", "GMAIL_CLIENT_SECRET", "GMAIL_REFRESH_TOKEN")
 
 SYSTEM_PROMPT = """Tu es un journaliste spécialisé dans l'actualité technologique.
 On te fournit les stories de la page d'accueil de Hacker News (object_id, titre, url, auteur, points, num_comments) et une limite top_n.
@@ -126,31 +130,58 @@ async def _tts_mp3(script: str, voice_id: str) -> str:
     return response.audio_data
 
 
-async def _gmail_send_email(
-    client: ToolCallClient,
-    *,
-    to: str,
-    subject: str,
-    body: str,
-    audio_b64: str,
-    filename: str,
-) -> object:
-    return await client.call_tool(
-        tool_name="send_email",
-        arguments={
-            "to": [to],
-            "subject": subject,
-            "body": body,
-            "attachments": [
-                {
-                    "filename": filename,
-                    "mimeType": "audio/mpeg",
-                    "content": audio_b64,
-                    "contentEncoding": "base64",
-                }
-            ],
-        },
+def _build_raw_mime(
+    to: str, subject: str, body: str, audio_b64: str, filename: str
+) -> str:
+    from email.message import EmailMessage
+
+    message = EmailMessage()
+    message["To"] = to
+    message["Subject"] = subject
+    message.set_content(body)
+    message.add_attachment(
+        base64.b64decode(audio_b64), maintype="audio", subtype="mpeg", filename=filename
     )
+    return base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+
+
+async def _gmail_access_token() -> str:
+    import httpx
+
+    missing = [name for name in GMAIL_ENV_VARS if not os.environ.get(name)]
+    if missing:
+        raise RuntimeError(
+            f"Gmail workspace secrets not bound to the worker: {', '.join(missing)}"
+        )
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            GOOGLE_TOKEN_URL,
+            data={
+                "client_id": os.environ["GMAIL_CLIENT_ID"],
+                "client_secret": os.environ["GMAIL_CLIENT_SECRET"],
+                "refresh_token": os.environ["GMAIL_REFRESH_TOKEN"],
+                "grant_type": "refresh_token",
+            },
+        )
+        response.raise_for_status()
+        return response.json()["access_token"]
+
+
+async def _gmail_send_email(
+    to: str, subject: str, body: str, audio_b64: str, filename: str
+) -> str | None:
+    import httpx
+
+    token = await _gmail_access_token()
+    raw = _build_raw_mime(to, subject, body, audio_b64, filename)
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(
+            GMAIL_SEND_URL,
+            headers={"Authorization": f"Bearer {token}"},
+            json={"raw": raw},
+        )
+        response.raise_for_status()
+        return response.json().get("id")
 
 
 @workflows.activity(
@@ -224,59 +255,24 @@ async def synthesize_podcast(script: str, voice_id: str) -> str:
     return audio_b64
 
 
-def _extract_message_id(result: object) -> str | None:
-    if isinstance(result, dict):
-        candidate = result.get("id") or result.get("messageId")
-        if candidate:
-            return str(candidate)
-        result = result.get("content")
-    if isinstance(result, list):
-        for block in result:
-            if isinstance(block, dict) and block.get("type") == "text":
-                try:
-                    parsed = json.loads(block.get("text") or "")
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(parsed, dict):
-                    candidate = parsed.get("id") or parsed.get("messageId")
-                    if candidate:
-                        return str(candidate)
-    return None
-
-
 @workflows.activity(
     name="hn-send-digest-email",
     start_to_close_timeout=timedelta(seconds=120),
     retry_policy_max_attempts=1,
 )
 async def send_digest_email(
-    to: str,
-    subject: str,
-    body: str,
-    audio_b64: str,
-    filename: str,
-    gmail_client: ToolCallClient = Depends(gmail),  # noqa: B008  documented Depends() DI pattern
+    to: str, subject: str, body: str, audio_b64: str, filename: str
 ) -> str | None:
-    result = await _gmail_send_email(
-        gmail_client,
-        to=to,
-        subject=subject,
-        body=body,
-        audio_b64=audio_b64,
-        filename=filename,
-    )
-    return _extract_message_id(result)
+    return await _gmail_send_email(to, subject, body, audio_b64, filename)
 
 
 @workflows.workflow.define(
     name="hn-tech-digest",
-    on_behalf_of=True,
     workflow_description=(
-        "Veille tech Hacker News à la demande : résumé en français envoyé dans Gmail "
-        "avec un podcast audio MP3 de 1-2 min. Déclenchement manuel uniquement, jamais planifié."
+        "Veille tech Hacker News : résumé en français envoyé dans Gmail avec un podcast audio "
+        "MP3 de 1-2 min. Planifié tous les jours à 08:00 Europe/Paris, aussi lançable manuellement."
     ),
 )
-@uses_connectors(gmail)
 class HnTechDigestWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, prompt: DigestInput) -> DigestResult:
