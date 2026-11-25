@@ -98,6 +98,20 @@ def test_parse_json_object_wrapped() -> None:
     assert mod._parse_json_object('Voici le JSON :\n{"a": 1}\nfin') == {"a": 1}
 
 
+def test_extract_message_id_plain_dict() -> None:
+    assert mod._extract_message_id({"id": "msg-1", "threadId": "t"}) == "msg-1"
+
+
+def test_extract_message_id_mcp_content_block() -> None:
+    result = {"content": [{"type": "text", "text": '{"id": "msg-2", "threadId": "t"}'}]}
+    assert mod._extract_message_id(result) == "msg-2"
+
+
+def test_extract_message_id_unknown_shape() -> None:
+    assert mod._extract_message_id({"unexpected": True}) is None
+    assert mod._extract_message_id("not-a-dict") is None
+
+
 async def test_hn_tech_digest_end_to_end(monkeypatch, temporal_env) -> None:
     sent: dict = {}
 

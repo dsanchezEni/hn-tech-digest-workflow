@@ -224,6 +224,26 @@ async def synthesize_podcast(script: str, voice_id: str) -> str:
     return audio_b64
 
 
+def _extract_message_id(result: object) -> str | None:
+    if isinstance(result, dict):
+        candidate = result.get("id") or result.get("messageId")
+        if candidate:
+            return str(candidate)
+        result = result.get("content")
+    if isinstance(result, list):
+        for block in result:
+            if isinstance(block, dict) and block.get("type") == "text":
+                try:
+                    parsed = json.loads(block.get("text") or "")
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(parsed, dict):
+                    candidate = parsed.get("id") or parsed.get("messageId")
+                    if candidate:
+                        return str(candidate)
+    return None
+
+
 @workflows.activity(
     name="hn-send-digest-email",
     start_to_close_timeout=timedelta(seconds=120),
@@ -245,10 +265,7 @@ async def send_digest_email(
         audio_b64=audio_b64,
         filename=filename,
     )
-    if isinstance(result, dict):
-        message_id = result.get("id") or result.get("messageId")
-        return str(message_id) if message_id else None
-    return None
+    return _extract_message_id(result)
 
 
 @workflows.workflow.define(
