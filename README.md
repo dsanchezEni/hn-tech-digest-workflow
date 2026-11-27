@@ -1,15 +1,21 @@
 # hn-tech-digest-workflow
 
-Workflow Mistral Cloud « hn-tech-digest », **planifié tous les jours à 08:00 (Europe/Paris)** et lançable manuellement à la demande. À chaque exécution, il lit la page d'accueil de Hacker News, ne retient que les actualités du secteur tech (pas les blogs personnels ni les sujets hors tech), puis envoie par Gmail :
+Workflow Mistral Cloud « hn-tech-digest », **déclenché manuellement uniquement (jamais planifié)**. À chaque exécution, il lit la page d'accueil de Hacker News **et** les flux RSS de l'actualité tech (cybersécurité, IA, produits tech : TechCrunch, Ars Technica, The Verge, Wired, VentureBeat, ZDNet, BleepingComputer, Krebs on Security, The Hacker News, Numerama), ne retient que les actualités du secteur tech (pas les blogs personnels ni les sujets hors tech), puis envoie dans la boîte Gmail de l'utilisateur qui déclenche le workflow :
 
 - un email en français résumant les principales actualités tech (destinataire par défaut : `dsanchez@campus-eni.fr`) ;
 - une pièce jointe audio MP3 (1 à 2 min, voix française Voxtral `voice_592`) présentant les titres comme un mini-podcast.
 
-## Architecture (mode planifié, non interactif)
+## Architecture (on-behalf-of, exécution ponctuelle)
 
-Une exécution planifiée n'a pas d'utilisateur déclencheur : le workflow n'est donc **pas** `on_behalf_of` (les schedules sont interdits en OBO) et tourne avec l'identité de service du déploiement :
+Le workflow est `on_behalf_of=True` : il s'exécute avec l'identité de l'utilisateur qui le lance. La plateforme interdit les schedules sur un workflow OBO, ce qui garantit le caractère « ponctuel, sur déclenchement manuel ».
 
-- appels Mistral (chat + TTS Voxtral) via `get_mistral_client()` avec les credentials du worker (`workflow_executor`) ;
-- envoi du mail via l'**API REST Gmail** directement, avec un refresh token fourni par des **secrets du workspace** liés au déploiement : `gmail_client_id`, `gmail_client_secret`, `gmail_refresh_token` (exposés aux workers comme `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`). Aucune valeur secrète n'est dans le code.
+- envoi du mail via le **connecteur `gmail`** (outil `send_email`, pièce jointe MP3 en base64, ≤ 3 Mo) avec les credentials Gmail de l'utilisateur déclencheur ;
+- appels Mistral (chat + TTS Voxtral `voxtral-mini-tts-3-0`) via `get_mistral_client()` avec l'identité de l'utilisateur déclencheur. Aucun secret n'est dans le code ni lié au déploiement.
+
+Le déploiement managé « hardened » (obligatoire pour OBO) est `hn-tech-digest-worker` sur Mistral Cloud.
 
 Voir `apps/worker/src/worker/workflows/hn_tech_digest.py`.
+
+## Déclencher une exécution
+
+Depuis Studio (Workflows → `hn-tech-digest` → Start workflow, entrée `{}`), ou via l'API/MCP `execute_workflow` avec `workflow_identifier="hn-tech-digest"` et `input={}`. Entrées optionnelles : `to`, `top_n` (défaut 10), `voice_id` (défaut `voice_592`).
