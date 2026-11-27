@@ -104,7 +104,7 @@ class DigestContent(pydantic.BaseModel):
 
 
 class DigestInput(pydantic.BaseModel):
-    to: str = DEFAULT_RECIPIENT
+    to: str = ""  # empty = the triggering user's own Gmail address, resolved at runtime
     top_n: int = DEFAULT_TOP_N
     voice_id: str = DEFAULT_VOICE_ID
 
@@ -328,6 +328,47 @@ def _extract_message_id(result: object) -> str | None:
     return None
 
 
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _extract_own_email(result: object) -> str | None:
+    if isinstance(result, dict):
+        threads = result.get("threads")
+        if isinstance(threads, list):
+            for thread in threads:
+                if not isinstance(thread, dict):
+                    continue
+                messages = thread.get("messages")
+                if not isinstance(messages, list):
+                    continue
+                for message in messages:
+                    if isinstance(message, dict) and message.get("sender"):
+                        match = _EMAIL_RE.search(str(message["sender"]))
+                        if match:
+                            return match.group(0)
+        result = result.get("content")
+    if isinstance(result, list):
+        for block in result:
+            if isinstance(block, dict) and block.get("type") == "text":
+                try:
+                    parsed = json.loads(block.get("text") or "")
+                except json.JSONDecodeError:
+                    continue
+                found = _extract_own_email(parsed)
+                if found:
+                    return found
+    return None
+
+
+async def _gmail_search_threads(
+    client: ToolCallClient, query: str, page_size: int
+) -> object:
+    return await client.call_tool(
+        tool_name="search_threads",
+        arguments={"query": query, "pageSize": page_size},
+    )
+
+
 @workflows.activity(
     name="hn-fetch-front-page",
     start_to_close_timeout=timedelta(seconds=60),
@@ -431,6 +472,18 @@ async def synthesize_podcast(script: str, voice_id: str) -> str:
 
 
 @workflows.activity(
+    name="hn-resolve-own-email",
+    start_to_close_timeout=timedelta(seconds=60),
+    retry_policy_max_attempts=2,
+)
+async def resolve_own_email(
+    gmail_client: ToolCallClient = Depends(gmail),  # noqa: B008  documented Depends() DI pattern
+) -> str:
+    result = await _gmail_search_threads(gmail_client, "from:me newer_than:365d", 1)
+    return _extract_own_email(result) or DEFAULT_RECIPIENT
+
+
+@workflows.activity(
     name="hn-send-digest-email",
     start_to_close_timeout=timedelta(seconds=120),
     retry_policy_max_attempts=1,
@@ -467,12 +520,13 @@ async def send_digest_email(
 class HnTechDigestWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, prompt: DigestInput) -> DigestResult:
+        to = prompt.to.strip() or await resolve_own_email()
         stories, feeds = await asyncio.gather(fetch_front_page(), fetch_news_feeds())
         digest = await build_digest(stories, feeds.items, prompt.top_n)
         audio_b64 = await synthesize_podcast(digest.podcast_script, prompt.voice_id)
         filename = f"hn-tech-digest-{workflows.workflow.now().strftime('%Y-%m-%d')}.mp3"
         message_id = await send_digest_email(
-            prompt.to, digest.subject, digest.email_body, audio_b64, filename
+            to, digest.subject, digest.email_body, audio_b64, filename
         )
         return DigestResult(
             message_id=message_id,

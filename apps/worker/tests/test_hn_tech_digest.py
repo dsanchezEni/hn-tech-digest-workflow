@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 
 from mistralai.workflows.testing import create_test_worker
@@ -153,6 +154,32 @@ def test_extract_message_id_content_blocks() -> None:
     assert mod._extract_message_id({"content": []}) is None
 
 
+def test_extract_own_email_threads_dict() -> None:
+    result = {
+        "threads": [
+            {
+                "id": "t1",
+                "messages": [
+                    {
+                        "id": "m1",
+                        "sender": "Denis <dyonysosd@gmail.com>",
+                        "subject": "hi",
+                    }
+                ],
+            }
+        ]
+    }
+    assert mod._extract_own_email(result) == "dyonysosd@gmail.com"
+
+
+def test_extract_own_email_content_blocks() -> None:
+    inner = {"threads": [{"messages": [{"sender": "me@example.com"}]}]}
+    result = {"content": [{"type": "text", "text": json.dumps(inner)}]}
+    assert mod._extract_own_email(result) == "me@example.com"
+    assert mod._extract_own_email({"threads": []}) is None
+    assert mod._extract_own_email({"content": []}) is None
+
+
 def test_parse_feed_date_rfc822_and_iso() -> None:
     parsed = mod._parse_feed_date("Thu, 27 Nov 2026 10:00:00 +0000")
     assert parsed is not None and parsed.year == 2026 and parsed.tzinfo is not None
@@ -219,24 +246,36 @@ def test_aggregate_feeds_dedupes_and_counts() -> None:
 
 
 async def test_hn_tech_digest_end_to_end(monkeypatch, temporal_env) -> None:
-    sent: dict = {}
+    sent: list[dict] = []
 
     async def fake_gmail_send(client, *, to, subject, body, audio_b64, filename):
-        sent.update(
-            to=to, subject=subject, body=body, audio_b64=audio_b64, filename=filename
+        sent.append(
+            {
+                "to": to,
+                "subject": subject,
+                "body": body,
+                "audio_b64": audio_b64,
+                "filename": filename,
+            }
         )
         return {"content": [{"type": "text", "text": '{"id": "msg-123"}'}]}
+
+    async def fake_gmail_search(client, query, page_size):
+        assert query.startswith("from:me")
+        return {"threads": [{"messages": [{"sender": "dyonysosd@gmail.com"}]}]}
 
     monkeypatch.setattr(mod, "_http_get_json", _fake_http_get_json)
     monkeypatch.setattr(mod, "_http_get_text", _fake_http_get_text)
     monkeypatch.setattr(mod, "_chat_complete_json", _fake_chat_complete_json)
     monkeypatch.setattr(mod, "_tts_mp3", _fake_tts_mp3)
     monkeypatch.setattr(mod, "_gmail_send_email", fake_gmail_send)
+    monkeypatch.setattr(mod, "_gmail_search_threads", fake_gmail_search)
 
     async with create_test_worker(
         temporal_env,
         workflows=[mod.HnTechDigestWorkflow],
         activities=[
+            mod.resolve_own_email,
             mod.fetch_front_page,
             mod.fetch_news_feeds,
             mod.build_digest,
@@ -253,13 +292,25 @@ async def test_hn_tech_digest_end_to_end(monkeypatch, temporal_env) -> None:
         )
         result = await asyncio.wait_for(handle.result(), timeout=15)
 
+        handle2 = await temporal_env.client.start_workflow(
+            "hn-tech-digest",
+            {"to": "custom@example.com"},
+            id="test-hn-tech-digest-override",
+            task_queue="test-task-queue",
+            execution_timeout=WORKFLOW_EXECUTION_TIMEOUT,
+        )
+        result2 = await asyncio.wait_for(handle2.result(), timeout=15)
+
     assert result["message_id"] == "msg-123"
     assert result["subject"] == "Veille tech du jour"
     assert result["stories_count"] == 4
     assert result["articles_count"] == 2
     assert result["audio_b64_chars"] == len("QUJD" * 64)
-    assert sent["to"] == "dsanchez@campus-eni.fr"
-    assert sent["filename"].startswith("hn-tech-digest-")
-    assert sent["filename"].endswith(".mp3")
-    assert sent["audio_b64"] == "QUJD" * 64
-    assert "New AI chip announced by a major vendor" in sent["body"]
+    assert sent[0]["to"] == "dyonysosd@gmail.com"
+    assert sent[1]["to"] == "custom@example.com"
+    assert result2["message_id"] == "msg-123"
+    for entry in sent:
+        assert entry["filename"].startswith("hn-tech-digest-")
+        assert entry["filename"].endswith(".mp3")
+        assert entry["audio_b64"] == "QUJD" * 64
+        assert "New AI chip announced by a major vendor" in entry["body"]
