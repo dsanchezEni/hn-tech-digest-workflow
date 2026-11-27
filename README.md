@@ -16,6 +16,15 @@ Le déploiement managé « hardened » (obligatoire pour OBO) est `hn-tech-diges
 
 Voir `apps/worker/src/worker/workflows/hn_tech_digest.py`.
 
+## github-repo-catchup
+
+Workflow Mistral Cloud « github-repo-catchup » : en entrée, l'identifiant d'un dépôt GitHub (`owner/repo`) et une date (`YYYY-MM-DD`). Il liste les pull requests **fusionnées depuis cette date** et celles **encore ouvertes en attente de revue**, rédige pour chacune un **résumé en une ligne en français avec son lien**, puis publie le récapitulatif dans la **conversation Teams de l'utilisateur avec lui-même** (chat oneOnOne avec soi-même).
+
+- Champ d'entrée `dry_run=true` : génère et retourne le récapitulatif sans le poster sur Teams.
+- Le workflow tourne en `on_behalf_of` (identité de l'utilisateur qui le lance : connecteurs `github_app` + `teams`, appels API Mistral avec ses credentials), déployé en déploiement managé « hardened » sur Mistral Cloud. Déclenchement manuel uniquement, jamais planifié.
+
+Voir `apps/worker/src/worker/workflows/github_repo_catchup.py`.
+
 ## Déclencher une exécution
 
 Depuis Studio (Workflows → `hn-tech-digest` → Start workflow, entrée `{}`), ou via l'API/MCP `execute_workflow` avec `workflow_identifier="hn-tech-digest"` et `input={}`. Entrées optionnelles : `to` (vide = sa propre adresse Gmail), `top_n` (défaut 10), `voice_id` (défaut `voice_592`).
